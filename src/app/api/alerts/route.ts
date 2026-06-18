@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createServerSupabase } from "@/lib/supabase/server";
+import { requireDeviceKey } from "@/lib/auth";
 import type { AlertIngestPayload, AlertType, AlertSeverity } from "@/lib/types";
 
 // This route runs on the Node.js runtime (service-role key + server-only).
@@ -17,11 +18,8 @@ function isFiniteNumber(v: unknown): v is number {
 // POST /api/alerts — called by the Raspberry Pi to report a risk event.
 export async function POST(request: Request) {
   // --- Auth: shared secret in the x-api-key header ---
-  const apiKey = request.headers.get("x-api-key");
-  const expected = process.env.DEVICE_API_KEY;
-  if (!expected || apiKey !== expected) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const unauthorized = requireDeviceKey(request);
+  if (unauthorized) return unauthorized;
 
   // --- Parse + validate body ---
   let body: AlertIngestPayload;

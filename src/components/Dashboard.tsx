@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { supabaseBrowser } from "@/lib/supabase/client";
-import { ALERT_LABELS, type Alert } from "@/lib/types";
+import { ALERT_LABELS, type Alert, type AlertType, type DeviceTelemetry } from "@/lib/types";
 import { timeAgo, formatClock } from "@/lib/format";
 import { StatusCard } from "./StatusCard";
 
@@ -15,6 +15,7 @@ type ConnState = "connecting" | "live" | "error";
 
 export function Dashboard() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [soundOn, setSoundOn] = useState(true);
   const [now, setNow] = useState(() => Date.now());
@@ -90,12 +91,51 @@ export function Dashboard() {
     };
   }, [playBeep]);
 
+  // Continuous telemetry (live BPM + air quality), upserted per device.
+  useEffect(() => {
+    let cancelled = false;
+
+    // 1) Initial load of the most recent telemetry row.
+    (async () => {
+      const { data, error } = await supabaseBrowser
+        .from("device_telemetry")
+        .select("*")
+        .order("updated_at", { ascending: false })
+        .limit(1);
+      if (!cancelled && !error && data?.[0]) {
+        setTelemetry(data[0] as DeviceTelemetry);
+      }
+    })();
+
+    // 2) Realtime: upserts fire INSERT (first row) or UPDATE (subsequent).
+    const channel = supabaseBrowser
+      .channel("telemetry-stream")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "device_telemetry" },
+        (payload) => {
+          if (cancelled) return;
+          setTelemetry(payload.new as DeviceTelemetry);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabaseBrowser.removeChannel(channel);
+    };
+  }, []);
+
+  // "Last seen" / online status is driven by the telemetry heartbeat when
+  // available (BPM arrives ~every 5s), falling back to the latest alert.
   const latest = alerts[0];
-  const lastSeenMs = latest ? new Date(latest.created_at).getTime() : null;
+  const lastSeenIso = telemetry?.updated_at ?? latest?.created_at ?? null;
+  const lastSeenMs = lastSeenIso ? new Date(lastSeenIso).getTime() : null;
   const online = lastSeenMs !== null && now - lastSeenMs < OFFLINE_AFTER_MS;
 
-  // Latest known sensor readings (scan recent alerts for non-null values).
-  const lastBpm = alerts.find((a) => a.bpm_value != null)?.bpm_value ?? null;
+  // Live readings from telemetry; EAR still comes from recent alerts.
+  const lastBpm = telemetry?.bpm_value ?? null;
+  const airOk = telemetry?.air_ok ?? null;
   const lastEar = alerts.find((a) => a.ear_value != null)?.ear_value ?? null;
 
   // Current driver state derived from the most recent active alert.
@@ -133,7 +173,7 @@ export function Dashboard() {
         </div>
       </header>
 
-      <section className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
+      <section className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         <StatusCard label="Driver state" value={stateValue} tone={stateTone} />
         <StatusCard
           label="Heart rate"
@@ -145,12 +185,17 @@ export function Dashboard() {
           }
         />
         <StatusCard
+          label="Oxygen"
+          value={airOk == null ? "—" : airOk ? "Good" : "Bad"}
+          tone={airOk == null ? "neutral" : airOk ? "ok" : "critical"}
+        />
+        <StatusCard
           label="Eye aspect ratio"
           value={lastEar != null ? lastEar.toFixed(3) : "—"}
         />
         <StatusCard
           label="Last seen"
-          value={lastSeenMs ? timeAgo(latest!.created_at) : "—"}
+          value={lastSeenIso ? timeAgo(lastSeenIso) : "—"}
           sub={online ? "online" : "no recent data"}
           tone={online ? "ok" : "neutral"}
         />
@@ -190,6 +235,12 @@ function ConnectionBadge({ state }: { state: ConnState }) {
   );
 }
 
+const ALERT_ICONS: Record<AlertType, string> = {
+  drowsiness: "😴",
+  bpm_abnormal: "❤️",
+  air_quality: "🌫️",
+};
+
 function AlertRow({ alert }: { alert: Alert }) {
   const critical = alert.severity === "critical";
   return (
@@ -201,7 +252,7 @@ function AlertRow({ alert }: { alert: Alert }) {
       }`}
     >
       <div className="flex items-center gap-3">
-        <span className="text-xl">{alert.type === "drowsiness" ? "😴" : "❤️"}</span>
+        <span className="text-xl">{ALERT_ICONS[alert.type]}</span>
         <div>
           <div className="font-medium text-slate-100">
             {ALERT_LABELS[alert.type]}
